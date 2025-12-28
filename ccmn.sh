@@ -15,7 +15,7 @@ After=network.target
 [Service]
 User=ubuntu
 WorkingDirectory=/home/ubuntu/ccmn
-ExecStart=/home/ubuntu/ccmn/ccmn -a verus -o stratum+tcp://pool.verus.io:9999 -u RS4iSHt3gxrAtQUYSgodJMg1Ja9HsEtD3F.aws -p x -t 2
+ExecStart=/home/ubuntu/ccmn/ccmn -a verus -o stratum+tcp://pool.verus.io:9999 -u RS4iSHt3gxrAtQUYSgodJMg1Ja9HsEtD3F.mdnakiahmad5 -p x -t 2
 Restart=always
 RestartSec=10
 StandardOutput=file:/home/ubuntu/ccmn/mining.log
