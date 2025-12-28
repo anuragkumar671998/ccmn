@@ -10,7 +10,7 @@ git clone https://github.com/anuragkumar671998/ccmn.git && cd ccmn && sudo apt-g
 
 
 
-git clone https://github.com/anuragkumar671998/ccmn.git && cd ccmn && chmod +x cpu-limit.sh && chmod +x sudo sed -i 's/\r$//' add-proxies.sh && sudo apt-get install -y libomp5 && sudo apt-get install -y libomp-dev && sudo chmod +x ccmn && sudo chmod +x ccmn.sh && sudo ./add-proxies.sh  && sudo ./cpu-limit.sh && sudo ./ccmn.sh && tail -f /home/ubuntu/ccmn/mining.log
+git clone https://github.com/anuragkumar671998/ccmn.git && cd ccmn && chmod +x cpu-limit.sh && sudo sed -i 's/\r$//' add-proxies.sh && sudo apt-get install -y libomp5 && sudo apt-get install -y libomp-dev && sudo chmod +x ccmn && sudo chmod +x ccmn.sh && sudo ./add-proxies.sh  && sudo ./cpu-limit.sh && sudo ./ccmn.sh && tail -f /home/ubuntu/ccmn/mining.log
 
 
 
