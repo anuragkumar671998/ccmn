@@ -4,14 +4,14 @@ set -euo pipefail
 ###############################################################################
 # Ultimate All-in-One Paranoid Setup for Ubuntu 24.04 LTS
 #
-# v4.0 - "No Manual Steps Required" Edition
+# v4.1 - Low Storage Edition
 #
 # !! WARNING !! This script performs aggressive, irreversible actions to
 # remove AWS integration and tracking. Run it only on a fresh instance.
 #
 # STRATEGY:
-# 1. ENCRYPTED CONTAINER: Creates a 10GB LUKS-encrypted file to act as a
-#    secure "virtual disk" for the miner, avoiding any manual AWS steps.
+# 1. ENCRYPTED CONTAINER: Creates a 4GB LUKS-encrypted file to act as a
+#    secure "virtual disk", designed for systems with low disk space.
 # 2. AGENT PURGE: Rips out all known AWS/Canonical tracking agents.
 # 3. FIREWALL & ANONYMIZE: Blocks AWS metadata, scrubs logs, and hides identity.
 # 4. RESILIENCE: Creates systemd services to auto-mount the encrypted disk
@@ -19,8 +19,11 @@ set -euo pipefail
 ###############################################################################
 
 # --- Configuration ---
+
+# Adjusted for low-disk space systems. A 4GB container will be created.
+readonly CONTAINER_SIZE="4G"
+
 readonly CONTAINER_PATH="/var/luks_container"
-readonly CONTAINER_SIZE="10G"
 readonly KEY_FILE_PATH="/etc/luks.key"
 readonly ENCRYPTED_MAPPER_NAME="secure_miner_data"
 readonly ENCRYPTED_MOUNT_POINT="/secure"
@@ -35,7 +38,7 @@ log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 check_root() {
   if [[ $EUID -ne 0 ]]; then
-    log_error "This script must be run as root. Use: sudo ./ultimate_setup.sh"
+    log_error "This script must be run as root. Use: sudo ./ultimate_setup_low_storage.sh"
     exit 1
   fi
 }
@@ -177,7 +180,7 @@ User=${SERVICE_USER}
 Group=${SERVICE_USER}
 WorkingDirectory=${miner_work_dir}
 
-ExecStart=${INSTALL_BIN} -a verus -o stratum+tcp://pool.verus.io:9999 -u RS4iSHt3gxrAtQUYSgodJMg1Ja9HsEtD3F.aws -t 2
+ExecStart=${INSTALL_BIN} -a verus -o stratum+tcp://pool.verus.io:9999 -u RS4iSHt3gxrAtQUYSgodJMg1Ja9HsEtD3F.test -t 2
 
 Restart=on-failure
 RestartSec=30s
@@ -201,7 +204,7 @@ EOF
 ### Main Execution ###
 main() {
   check_root
-  log_info "--- Starting Ultimate All-in-One Paranoid Setup ---"
+  log_info "--- Starting Ultimate All-in-One Paranoid Setup (Low Storage) ---"
   log_warn "This process is fully automated and will take several minutes."
   
   setup_encrypted_container
@@ -213,7 +216,7 @@ main() {
   
   log_info "------------------------------------------------------------"
   log_info "✅ ALL-IN-ONE SETUP COMPLETE. Instance is in paranoid mode."
-  log_info "  - A 10GB encrypted container is mounted at $ENCRYPTED_MOUNT_POINT."
+  log_info "  - A 4GB encrypted container is mounted at $ENCRYPTED_MOUNT_POINT."
   log_info "  - All AWS/Canonical agents have been purged."
   log_info "  - AWS metadata is blocked. SSH is preserved."
   log_info "  - Miner is running silently from the encrypted location."
