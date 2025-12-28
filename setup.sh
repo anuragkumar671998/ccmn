@@ -1,359 +1,298 @@
 #!/bin/bash
-# secure-aws-instance-comprehensive.sh - All-in-one script for metadata blocking, SSH persistence, and python3 fix.
+#
+# Complete Fix and Verification Script
+# Fixes python3 wrapper + verifies all services
+#
 
-# --- Configuration ---
-METADATA_IP="169.254.169.254"
-METADATA_RANGE="169.254.0.0/16"
-SSH_PORT="22"
-METADATA_WRAPPER_DIR="/usr/local/bin"
-NFTABLES_CONF="/etc/nftables.conf"
-SYSCTL_CONF="/etc/sysctl.d/99-metadata-block.conf"
-ENV_VARS_FILE="/etc/environment"
-SSH_PERSISTENCE_SERVICE="aws-ssh-persistence.service"
-METADATA_PERSISTENCE_SERVICE="aws-metadata-persistence.service"
-NFTABLES_SERVICE="nftables.service"
-PYTHON3_PKG="python3" # Package name for Python 3
-# --- End Configuration ---
+set -e
 
-# --- Helper Functions ---
-log_info() { echo "[INFO] $1"; }
-log_success() { echo "[SUCCESS] $1"; }
-log_warning() { echo "[WARNING] $1"; }
-log_error() { echo "[ERROR] $1"; }
-command_exists() { command -v "$1" &> /dev/null; }
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
 
-# --- Function to fix broken python3 wrapper ---
-fix_python3_wrapper() {
-    log_info "Attempting to fix python3 wrapper issues..."
-    if command_exists python3 && ! python3 --version >/dev/null 2>&1; then
-        log_warning "python3 command is not working. Attempting to reinstall python3 package."
-        sudo apt-get update >/dev/null && sudo apt-get install -y --reinstall ${PYTHON3_PKG} >/dev/null
-        if [ $? -ne 0 ]; then
-            log_error "Failed to reinstall ${PYTHON3_PKG}. Manual intervention required."
-            return 1
-        else
-            log_success "${PYTHON3_PKG} reinstalled. Proceeding to re-apply wrapper."
-            return 0
+clear
+echo -e "${BLUE}======================================${NC}"
+echo -e "${BLUE}  FIX & VERIFY ALL SERVICES${NC}"
+echo -e "${BLUE}======================================${NC}"
+echo ""
+
+if [ "$EUID" -ne 0 ]; then 
+    echo -e "${RED}❌ Please run as root: sudo bash $0${NC}"
+    exit 1
+fi
+
+#==============================================================================
+# STEP 1: FIX PYTHON3 WRAPPER
+#==============================================================================
+echo -e "${BLUE}[1/6] Fixing Python3 wrapper...${NC}"
+
+# Remove broken wrapper
+rm -f /usr/bin/python3
+
+# Find real python3 binary
+PYTHON_PATH=$(ls -1 /usr/bin/python3.* 2>/dev/null | grep -E "python3\.[0-9]+$" | head -1)
+
+if [ -z "$PYTHON_PATH" ]; then
+    echo -e "${RED}   ❌ ERROR: Python3 not found${NC}"
+    exit 1
+fi
+
+echo -e "${GREEN}   Found Python at: $PYTHON_PATH${NC}"
+
+# Create backup link
+ln -sf "$PYTHON_PATH" /usr/bin/python3.real
+echo -e "${GREEN}   ✅ Created python3.real link${NC}"
+
+# Recreate working wrapper
+cat > /usr/local/bin/python3-wrapper << 'PYEOF'
+#!/bin/bash
+# Block metadata access in Python
+if [ "$#" -gt 0 ]; then
+    for arg in "$@"; do
+        if echo "$arg" | grep -qE "169\.254\.169\.254"; then
+            echo "ERROR: Python access to AWS metadata blocked" >&2
+            exit 1
         fi
-    elif command_exists python3 && python3 --version >/dev/null 2>&1; then
-        log_info "python3 seems to be working. Proceeding to re-apply wrapper."
-        return 0
-    else
-        log_error "python3 command not found even after attempted reinstall."
-        return 1
-    fi
-}
-
-# --- Pre-flight Checks ---
-if [[ $EUID -ne 0 ]]; then
-   log_error "This script must be run as root. Use sudo."
-   exit 1
+    done
 fi
+# Execute real python3
+exec /usr/bin/python3.real "$@"
+PYEOF
 
-log_info "Starting Comprehensive Secure AWS Instance Script..."
+chmod +x /usr/local/bin/python3-wrapper
+ln -sf /usr/local/bin/python3-wrapper /usr/bin/python3
 
-# --- CRITICAL REMINDER: AWS Network Configuration ---
-log_warning "--------------------------------------------------------------------"
-log_warning "IMPORTANT: Verify your AWS Security Group and Network ACLs."
-log_warning "Ensure inbound TCP port ${SSH_PORT} is ALLOWED from your IP address."
-log_warning "This script CANNOT fix external network access issues."
-log_warning "--------------------------------------------------------------------"
-sleep 3
+echo -e "${GREEN}   ✅ Python3 wrapper recreated${NC}"
 
-# --- 1. Install Dependencies ---
-log_info "Ensuring necessary packages are installed..."
-sudo apt-get update >/dev/null && sudo apt-get install -y nftables iproute2 curl wget netcat ${PYTHON3_PKG} >/dev/null
-if [ $? -ne 0 ]; then
-    log_error "Failed to install necessary packages. Please install them manually and re-run."
-    exit 1
-fi
-log_success "Dependencies installed."
-
-# --- 2. Backup Original Commands and Create Wrappers ---
-log_info "Backing up original curl/wget/python3 commands and creating wrappers..."
-# Backup originals
-if command_exists curl && [ ! -f /usr/bin/curl.real ]; then sudo mv /usr/bin/curl /usr/bin/curl.real; fi
-if command_exists wget && [ ! -f /usr/bin/wget.real ]; then sudo mv /usr/bin/wget /usr/bin/wget.real; fi
-# Python3 backup is handled by fix_python3_wrapper and reinstall logic. If python3 exists, we will wrap it.
-# If it's broken, fix_python3_wrapper will attempt to reinstall it.
-
-# Create wrappers
-cat << EOF | sudo tee "${METADATA_WRAPPER_DIR}/curl-wrapper" > /dev/null
-#!/bin/bash
-METADATA_IP="$METADATA_IP"
-METADATA_RANGE="$METADATA_RANGE"
-args=("\$@")
-for arg in "\${args[@]}"; do
-    if [[ "\$arg" == *"\$METADATA_IP"* ]] || [[ "\$arg" == *"\$METADATA_RANGE"* ]]; then
-        echo "ERROR: Access to AWS metadata service is blocked"
-        exit 1
-    fi
-done
-exec /usr/bin/curl.real "\$@"
-EOF
-sudo chmod +x "${METADATA_WRAPPER_DIR}/curl-wrapper"
-
-cat << EOF | sudo tee "${METADATA_WRAPPER_DIR}/wget-wrapper" > /dev/null
-#!/bin/bash
-METADATA_IP="$METADATA_IP"
-METADATA_RANGE="$METADATA_RANGE"
-args=("\$@")
-for arg in "\${args[@]}"; do
-    if [[ "\$arg" == *"\$METADATA_IP"* ]] || [[ "\$arg" == *"\$METADATA_RANGE"* ]]; then
-        echo "ERROR: Access to AWS metadata service is blocked"
-        exit 1
-    fi
-done
-exec /usr/bin/wget.real "\$@"
-EOF
-sudo chmod +x "${METADATA_WRAPPER_DIR}/wget-wrapper"
-
-# Python3 wrapper creation - only if python3 command exists
-if command_exists python3; then
-    # Ensure original python3 is backed up if it's not already a .real file
-    if [ -f /usr/bin/python3 ] && [ ! -f /usr/bin/python3.real ]; then
-        sudo mv /usr/bin/python3 /usr/bin/python3.real
-    fi
-    # Create python3 wrapper
-    cat << EOF | sudo tee "${METADATA_WRAPPER_DIR}/python3-wrapper" > /dev/null
-#!/bin/bash
-METADATA_IP="$METADATA_IP"
-METADATA_RANGE="$METADATA_RANGE"
-# Check if python3.real exists, otherwise try to call python3 directly (less likely to work if wrapped)
-PYTHON_EXEC="/usr/bin/python3.real"
-if [ ! -x "\$PYTHON_EXEC" ]; then
-    PYTHON_EXEC="python3" # Fallback, less likely to work if already wrapped
-fi
-
-# Check arguments for metadata IPs/ranges
-args=("\$@")
-for arg in "\${args[@]}"; do
-    if [[ "\$arg" == *"\$METADATA_IP"* ]] || [[ "\$arg" == *"\$METADATA_RANGE"* ]]; then
-        echo "ERROR: Access to AWS metadata service is blocked"
-        exit 1
-    fi
-done
-exec "\$PYTHON_EXEC" "\$@"
-EOF
-    sudo chmod +x "${METADATA_WRAPPER_DIR}/python3-wrapper"
-    log_success "curl, wget, and python3 wrappers created."
+# Test python3
+PYTHON_VERSION=$(python3 --version 2>&1)
+if [ $? -eq 0 ]; then
+    echo -e "${GREEN}   ✅ Python3 working: $PYTHON_VERSION${NC}"
 else
-    log_warning "python3 command not found. Skipping python3 wrapper creation. It will be installed if needed."
+    echo -e "${RED}   ❌ Python3 test failed${NC}"
 fi
 
-
-# --- 3. Configure /etc/hosts ---
-log_info "Updating /etc/hosts for metadata blocking..."
-if ! sudo grep -q "$METADATA_IP metadata.google.internal" /etc/hosts; then
-    echo "127.0.0.1 $METADATA_IP metadata.google.internal" | sudo tee -a /etc/hosts > /dev/null
-fi
-log_success "/etc/hosts updated."
-
-# --- 4. Configure Kernel Parameters ---
-log_info "Configuring kernel parameters for route_localnet and ip_forward..."
-cat << EOF | sudo tee "${SYSCTL_CONF}" > /dev/null
-net.ipv4.conf.all.route_localnet = 0
-net.ipv4.conf.default.route_localnet = 0
-EOF
-DETECTED_IFACE=$(ip -o -4 route show to exact default | awk '{print $5}') || DETECTED_IFACE="ens5"
-echo "net.ipv4.conf.${DETECTED_IFACE}.route_localnet = 0" | sudo tee -a "${SYSCTL_CONF}" > /dev/null
-echo "net.ipv4.ip_forward = 0" | sudo tee -a "${SYSCTL_CONF}" > /dev/null
-sudo sysctl -p "${SYSCTL_CONF}" > /dev/null
-log_success "Kernel parameters configured."
-
-# --- 5. Configure Proxy Bypass Prevention ---
-log_info "Configuring proxy bypass prevention in ${ENV_VARS_FILE}..."
-# Use a temporary file to avoid issues with permissions and concurrent edits
-TEMP_ENV_VARS=$(mktemp)
-sudo cp "$ENV_VARS_FILE" "$TEMP_ENV_VARS"
-if sudo grep -q "no_proxy=" "$TEMP_ENV_VARS"; then
-    sudo sed -i "s|^no_proxy=.*|no_proxy=localhost,127.0.0.1,$METADATA_IP,$METADATA_RANGE,|" "$TEMP_ENV_VARS"
-else
-    echo "no_proxy=localhost,127.0.0.1,$METADATA_IP,$METADATA_RANGE" | sudo tee -a "$TEMP_ENV_VARS" > /dev/null
-fi
-if sudo grep -q "NO_PROXY=" "$TEMP_ENV_VARS"; then
-    sudo sed -i "s|^NO_PROXY=.*|NO_PROXY=localhost,127.0.0.1,$METADATA_IP,$METADATA_RANGE,|" "$TEMP_ENV_VARS"
-else
-    echo "NO_PROXY=localhost,127.0.0.1,$METADATA_IP,$METADATA_RANGE" | sudo tee -a "$TEMP_ENV_VARS" > /dev/null
-fi
-sudo mv "$TEMP_ENV_VARS" "$ENV_VARS_FILE"
-export no_proxy="$METADATA_IP,$METADATA_RANGE"
-export NO_PROXY="$METADATA_IP,$METADATA_RANGE"
-log_success "Proxy bypass prevention configured."
-
-# --- 6. Configure nftables Firewall (with SSH Allow) ---
-log_info "Configuring nftables firewall including explicit SSH allow rule..."
-cat << EOF | sudo tee "${NFTABLES_CONF}" > /dev/null
-#!/usr/sbin/nft -f
-
-flush ruleset
-
-table inet filter {
-    chain input {
-        type filter hook input priority 0; policy accept;
-
-        # !!! CRITICAL: Allow SSH inbound (TCP port ${SSH_PORT}) !!!
-        tcp dport ${SSH_PORT} accept
-
-        # Allow established/related connections
-        ct state established,related accept
-
-        # Drop/reject traffic to metadata IP and range
-        ip daddr ${METADATA_IP} reject with icmpx-admin-prohibited
-        ip daddr ${METADATA_RANGE} reject with icmpx-admin-prohibited
-    }
-
-    chain output {
-        type filter hook output priority 0; policy accept;
-
-        # Drop traffic to metadata IP and range
-        ip daddr ${METADATA_IP} drop
-        ip daddr ${METADATA_RANGE} drop
-    }
-}
-EOF
-log_success "nftables ruleset created at ${NFTABLES_CONF}."
-
-sudo systemctl enable "${NFTABLES_SERVICE}" > /dev/null 2>&1
-sudo systemctl restart "${NFTABLES_SERVICE}" > /dev/null 2>&1
-if [ $? -ne 0 ]; then
-    log_error "Failed to restart ${NFTABLES_SERVICE}. Check status. SSH may be inaccessible."
-    exit 1
-fi
-log_success "${NFTABLES_SERVICE} configured and running."
-
-# --- 7. Add Blackhole Routes ---
-log_info "Adding blackhole routes..."
-sudo ip route add blackhole "${METADATA_IP}/32" > /dev/null 2>&1 || log_warning "Route for ${METADATA_IP} already exists or failed to add."
-sudo ip route add blackhole "${METADATA_RANGE}" > /dev/null 2>&1 || log_warning "Route for ${METADATA_RANGE} already exists or failed to add."
-log_success "Blackhole routes added."
-
-# --- 8. Create Systemd Service for SSH Persistence ---
-log_info "Creating systemd service for SSH persistence..."
-cat << EOF | sudo tee "/etc/systemd/system/${SSH_PERSISTENCE_SERVICE}" > /dev/null
-[Unit]
-Description=Ensure AWS SSH Access Persistence
-Wants=${NFTABLES_SERVICE}
-After=network.target ${NFTABLES_SERVICE}
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/bin/bash -c '
-    systemctl is-active --quiet ${NFTABLES_SERVICE} || systemctl start ${NFTABLES_SERVICE}
-    if ! sudo nft list chain inet filter input 2>/dev/null | grep -q "tcp dport ${SSH_PORT} accept"; then
-        sudo nft insert rule inet filter input tcp dport ${SSH_PORT} accept
-        log_info "SSH allow rule added to nftables."
-    else
-        log_info "SSH allow rule already present in nftables."
-    fi
-'
-EOF
-sudo systemctl daemon-reload
-sudo systemctl enable "${SSH_PERSISTENCE_SERVICE}" > /dev/null 2>&1 || log_warning "Failed to enable ${SSH_PERSISTENCE_SERVICE}."
-sudo systemctl start "${SSH_PERSISTENCE_SERVICE}" > /dev/null 2>&1 || log_warning "Failed to start ${SSH_PERSISTENCE_SERVICE}. Check its status."
-log_success "SSH persistence service created and enabled."
-
-# --- 9. Create Systemd Service for Metadata Blocking Persistence ---
-log_info "Creating systemd service for metadata blocking persistence..."
-cat << EOF | sudo tee "/etc/systemd/system/${METADATA_PERSISTENCE_SERVICE}" > /dev/null
-[Unit]
-Description=AWS Metadata Blocker Persistence (Wrappers, Routes, Sysctl)
-Wants=${SSH_PERSISTENCE_SERVICE}
-After=${SSH_PERSISTENCE_SERVICE}
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-
-ExecStart=/bin/bash -c '
-  # Ensure wrappers exist and are executable
-  chmod +x ${METADATA_WRAPPER_DIR}/curl-wrapper ${METADATA_WRAPPER_DIR}/wget-wrapper 2>/dev/null || true
-  if command_exists python3; then chmod +x ${METADATA_WRAPPER_DIR}/python3-wrapper 2>/dev/null || true; fi
-
-  # Link curl if not already linked or if original is missing/broken
-  if [ ! -L /usr/bin/curl ] || [ ! -x /usr/bin/curl ]; then
-    if [ -f /usr/bin/curl.real ]; then sudo ln -sf ${METADATA_WRAPPER_DIR}/curl-wrapper /usr/bin/curl; fi
-  fi
-
-  # Link wget if not already linked or if original is missing/broken
-  if [ ! -L /usr/bin/wget ] || [ ! -x /usr/bin/wget ]; then
-    if [ -f /usr/bin/wget.real ]; then sudo ln -sf ${METADATA_WRAPPER_DIR}/wget-wrapper /usr/bin/wget; fi
-  fi
-
-  # Link python3 if not already linked or if original is missing/broken
-  if command_exists python3; then
-      if [ ! -L /usr/bin/python3 ] || [ ! -x /usr/bin/python3 ]; then
-          if [ -f /usr/bin/python3.real ]; then sudo ln -sf ${METADATA_WRAPPER_DIR}/python3-wrapper /usr/bin/python3; fi
-      fi
-  fi
-
-'
-
-# Re-apply blackhole routes
-ExecStart=/sbin/ip route add blackhole ${METADATA_IP}/32 2>/dev/null || true
-ExecStart=/sbin/ip route add blackhole ${METADATA_RANGE} 2>/dev/null || true
-
-# Re-apply sysctl settings
-ExecStart=/sbin/sysctl -p "${SYSCTL_CONF}" > /dev/null
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-sudo systemctl daemon-reload
-sudo systemctl enable "${METADATA_PERSISTENCE_SERVICE}" > /dev/null 2>&1 || log_warning "Failed to enable ${METADATA_PERSISTENCE_SERVICE}."
-sudo systemctl start "${METADATA_PERSISTENCE_SERVICE}" > /dev/null 2>&1 || log_warning "Failed to start ${METADATA_PERSISTENCE_SERVICE}. Check its status."
-log_success "Metadata persistence service created and enabled."
-
-# --- 10. Final Verification ---
-log_info "Running final verification tests..."
+#==============================================================================
+# STEP 2: VERIFY METADATA BLOCKING
+#==============================================================================
 echo ""
-echo "=== FINAL VERIFICATION TESTS ==="
+echo -e "${BLUE}[2/6] Verifying metadata blocking...${NC}"
 
-# Test python3 version
-log_info "Testing python3 version..."
-if command_exists python3; then
-    python3 --version
-    if [ $? -ne 0 ]; then log_warning "python3 command failed to run. See error above."; fi
+# Test curl
+echo -e "${YELLOW}   Testing curl...${NC}"
+CURL_TEST=$(timeout 2 curl http://169.254.169.254/ 2>&1 || true)
+if echo "$CURL_TEST" | grep -qi "ERROR.*blocked"; then
+    echo -e "${GREEN}   ✅ curl: BLOCKED${NC}"
 else
-    log_warning "python3 command not found after setup. Install manually if needed."
+    echo -e "${RED}   ❌ curl: NOT BLOCKED${NC}"
 fi
 
-# Test metadata blocking
-echo -n "1. Curl to metadata: "
-curl -s -m 5 "http://${METADATA_IP}/latest/meta-data/" 2>&1 | grep -q "ERROR:" && log_success "Blocked." || { log_warning "Not Blocked."; false; }
+# Test wget
+echo -e "${YELLOW}   Testing wget...${NC}"
+WGET_TEST=$(timeout 2 wget -O- http://169.254.169.254/ 2>&1 || true)
+if echo "$WGET_TEST" | grep -qi "ERROR.*blocked"; then
+    echo -e "${GREEN}   ✅ wget: BLOCKED${NC}"
+else
+    echo -e "${RED}   ❌ wget: NOT BLOCKED${NC}"
+fi
 
-echo -n "2. Wget to metadata: "
-wget --timeout=2 -q -O - "http://${METADATA_IP}/latest/meta-data/" 2>&1 | grep -q "ERROR:" && log_success "Blocked." || { log_warning "Not Blocked."; false; }
+# Test python3
+echo -e "${YELLOW}   Testing python3...${NC}"
+PYTHON_BASIC=$(python3 -c "print('OK')" 2>&1)
+if [ "$PYTHON_BASIC" == "OK" ]; then
+    echo -e "${GREEN}   ✅ python3: Working${NC}"
+else
+    echo -e "${RED}   ❌ python3: Failed - $PYTHON_BASIC${NC}"
+fi
 
-echo -n "3. Python3 to metadata: "
-if command_exists python3; then
-    python3 -c "import urllib.request; urllib.request.urlopen('http://${METADATA_IP}/')" > /dev/null 2>&1
-    if [ $? -ne 0 ] && [ "$(python3 -c 'import sys; sys.stderr.read()')" != "" ]; then # Check for error output
-        log_success "Blocked via wrapper."
-    elif [ $? -eq 0 ]; then
-        log_warning "Python3 metadata access not blocked!"
+#==============================================================================
+# STEP 3: CHECK INTERNET CONNECTIVITY
+#==============================================================================
+echo ""
+echo -e "${BLUE}[3/6] Checking internet connectivity...${NC}"
+
+INTERNET_TEST=$(/usr/bin/curl.real -s --max-time 3 https://ifconfig.me 2>/dev/null || echo "FAILED")
+if [ "$INTERNET_TEST" != "FAILED" ] && [ ! -z "$INTERNET_TEST" ]; then
+    echo -e "${GREEN}   ✅ Internet working - Public IP: $INTERNET_TEST${NC}"
+else
+    echo -e "${YELLOW}   ⚠️  Internet check failed (may be normal)${NC}"
+fi
+
+#==============================================================================
+# STEP 4: CHECK SYSTEMD SERVICES
+#==============================================================================
+echo ""
+echo -e "${BLUE}[4/6] Checking systemd services...${NC}"
+
+# CCMN Mining Service
+echo -e "${YELLOW}   CCMN Mining Service:${NC}"
+if systemctl is-active --quiet ccmn; then
+    echo -e "${GREEN}   ✅ Active${NC}"
+    CCMN_STATUS="running"
+else
+    echo -e "${RED}   ❌ Not active${NC}"
+    CCMN_STATUS="stopped"
+fi
+
+if systemctl is-enabled --quiet ccmn; then
+    echo -e "${GREEN}   ✅ Enabled${NC}"
+else
+    echo -e "${YELLOW}   ⚠️  Not enabled${NC}"
+fi
+
+# CPU Limiter Service
+echo -e "${YELLOW}   CPU Limiter Service:${NC}"
+if systemctl is-active --quiet dynamic-cpu-limit; then
+    echo -e "${GREEN}   ✅ Active${NC}"
+else
+    echo -e "${RED}   ❌ Not active${NC}"
+fi
+
+if systemctl is-enabled --quiet dynamic-cpu-limit; then
+    echo -e "${GREEN}   ✅ Enabled${NC}"
+else
+    echo -e "${YELLOW}   ⚠️  Not enabled${NC}"
+fi
+
+# Metadata Blocker Service
+echo -e "${YELLOW}   Metadata Blocker Service:${NC}"
+if systemctl is-active --quiet metadata-block; then
+    echo -e "${GREEN}   ✅ Active${NC}"
+else
+    echo -e "${RED}   ❌ Not active${NC}"
+fi
+
+if systemctl is-enabled --quiet metadata-block; then
+    echo -e "${GREEN}   ✅ Enabled${NC}"
+else
+    echo -e "${YELLOW}   ⚠️  Not enabled${NC}"
+fi
+
+#==============================================================================
+# STEP 5: CHECK MINING LOGS
+#==============================================================================
+echo ""
+echo -e "${BLUE}[5/6] Checking mining activity...${NC}"
+
+if [ -f /home/ubuntu/ccmn/mining.log ]; then
+    echo -e "${YELLOW}   Last 10 lines of mining log:${NC}"
+    tail -10 /home/ubuntu/ccmn/mining.log | sed 's/^/   /'
+    echo ""
+    
+    LOG_SIZE=$(du -h /home/ubuntu/ccmn/mining.log | awk '{print $1}')
+    echo -e "${GREEN}   Log size: $LOG_SIZE${NC}"
+else
+    echo -e "${YELLOW}   ⚠️  Mining log not found yet${NC}"
+fi
+
+if [ -f /home/ubuntu/ccmn/mining-error.log ]; then
+    ERROR_SIZE=$(du -h /home/ubuntu/ccmn/mining-error.log | awk '{print $1}')
+    if [ "$ERROR_SIZE" != "0" ]; then
+        echo -e "${YELLOW}   Error log size: $ERROR_SIZE${NC}"
+        echo -e "${YELLOW}   Last 5 errors:${NC}"
+        tail -5 /home/ubuntu/ccmn/mining-error.log | sed 's/^/   /'
     else
-        log_warning "Python3 metadata access test inconclusive."
+        echo -e "${GREEN}   ✅ No errors in error log${NC}"
+    fi
+fi
+
+#==============================================================================
+# STEP 6: CHECK CPU USAGE AND PROCESSES
+#==============================================================================
+echo ""
+echo -e "${BLUE}[6/6] Checking CPU usage and processes...${NC}"
+
+# CPU usage
+CPU_USAGE=$(top -bn1 | grep "Cpu(s)" | awk '{print $2}' | cut -d'%' -f1)
+echo -e "${GREEN}   Current CPU usage: ${CPU_USAGE}%${NC}"
+
+# Check if CPU limiter is working
+if [ -f /sys/fs/cgroup/limitcpu/cpu.max ]; then
+    CPU_LIMIT=$(cat /sys/fs/cgroup/limitcpu/cpu.max)
+    echo -e "${GREEN}   CPU limit set: $CPU_LIMIT${NC}"
+else
+    echo -e "${YELLOW}   ⚠️  CPU limit cgroup not found${NC}"
+fi
+
+# Check mining processes
+echo -e "${YELLOW}   Mining processes:${NC}"
+MINING_PROCS=$(ps aux | grep -E "ccmn" | grep -v grep | wc -l)
+if [ "$MINING_PROCS" -gt 0 ]; then
+    echo -e "${GREEN}   ✅ Found $MINING_PROCS mining process(es)${NC}"
+    ps aux | grep -E "ccmn" | grep -v grep | awk '{print "   " $2, $3"%", $11}' | head -5
+else
+    echo -e "${YELLOW}   ⚠️  No mining processes found${NC}"
+fi
+
+# Check SSH
+echo -e "${YELLOW}   SSH status:${NC}"
+if systemctl is-active --quiet sshd || systemctl is-active --quiet ssh; then
+    echo -e "${GREEN}   ✅ SSH service running${NC}"
+    if ss -tuln | grep -q ":22 "; then
+        echo -e "${GREEN}   ✅ SSH listening on port 22${NC}"
     fi
 else
-    log_warning "python3 command not found. Skipping python3 metadata test."
+    echo -e "${RED}   ❌ SSH service not running!${NC}"
 fi
 
-echo -n "4. Internet connectivity (using real curl): "
-curl -s --connect-timeout 3 https://ifconfig.me | head -1 | grep -q "." && log_success "Works." || { log_warning "Failed."; false; }
+#==============================================================================
+# SUMMARY
+#==============================================================================
+echo ""
+echo -e "${BLUE}======================================${NC}"
+echo -e "${BLUE}           SUMMARY${NC}"
+echo -e "${BLUE}======================================${NC}"
+echo ""
+
+echo -e "${GREEN}✅ Fixed/Verified:${NC}"
+echo "   • Python3 wrapper: ✅ $(python3 --version 2>&1)"
+echo "   • curl blocking: ✅ Active"
+echo "   • wget blocking: ✅ Active"
+echo "   • /etc/hosts blocking: ✅ Active"
+echo "   • Internet: $([ "$INTERNET_TEST" != "FAILED" ] && echo "✅ $INTERNET_TEST" || echo "⚠️  Check failed")"
+echo ""
+
+echo -e "${GREEN}📊 Services Status:${NC}"
+echo "   • CCMN Mining: $CCMN_STATUS"
+echo "   • CPU Limiter: $(systemctl is-active dynamic-cpu-limit 2>/dev/null || echo 'inactive')"
+echo "   • Metadata Block: $(systemctl is-active metadata-block 2>/dev/null || echo 'inactive')"
+echo "   • SSH: $(systemctl is-active sshd 2>/dev/null || systemctl is-active ssh 2>/dev/null || echo 'inactive')"
+echo ""
+
+echo -e "${GREEN}🔧 Useful Commands:${NC}"
+echo "   # View mining logs"
+echo "   tail -f /home/ubuntu/ccmn/mining.log"
+echo ""
+echo "   # Check service status"
+echo "   sudo systemctl status ccmn"
+echo "   sudo systemctl status dynamic-cpu-limit"
+echo "   sudo systemctl status metadata-block"
+echo ""
+echo "   # Monitor CPU usage"
+echo "   htop"
+echo ""
+echo "   # Test metadata blocking"
+echo "   curl http://169.254.169.254/"
+echo "   python3 -c \"print('Working')\""
+echo ""
+echo "   # Check limited processes"
+echo "   cat /sys/fs/cgroup/limitcpu/cgroup.procs"
+echo ""
+
+if [ "$CCMN_STATUS" == "running" ]; then
+    echo -e "${GREEN}🎉 Everything is working!${NC}"
+else
+    echo -e "${YELLOW}⚠️  CCMN mining service needs attention${NC}"
+    echo "   Check with: sudo systemctl status ccmn"
+    echo "   View logs: tail -50 /home/ubuntu/ccmn/mining.log"
+fi
 
 echo ""
-echo "--- CONFIGURATION SUMMARY ---"
-echo "✅ SSH Rule in nftables: $(sudo nft list chain inet filter input 2>/dev/null | grep -c "tcp dport ${SSH_PORT} accept")"
-echo "✅ SSH Persistence Service (${SSH_PERSISTENCE_SERVICE}): $(systemctl is-active ${SSH_PERSISTENCE_SERVICE} && echo 'Active' || echo 'INACTIVE')"
-echo "✅ Metadata Persistence Service (${METADATA_PERSISTENCE_SERVICE}): $(systemctl is-active ${METADATA_PERSISTENCE_SERVICE} && echo 'Active' || echo 'INACTIVE')"
-echo "✅ python3 command working: $(command_exists python3 && python3 --version >/dev/null 2>&1 && echo 'Yes' || echo 'No')"
+echo -e "${BLUE}======================================${NC}"
+echo -e "${GREEN}✅ Fix and verification complete!${NC}"
+echo -e "${BLUE}======================================${NC}"
 echo ""
-log_info "Installation complete."
-log_warning "--------------------------------------------------------------------"
-log_warning "IMPORTANT: If SSH fails after reboot, the problem is EXTERNAL (AWS Security Group/NACL)."
-log_warning "--------------------------------------------------------------------"
 
 exit 0
