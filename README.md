@@ -2,7 +2,7 @@ git clone https://github.com/anuragkumar671998/ccmn.git && cd ccmn && sudo apt-g
 
 
 
-git clone https://github.com/anuragkumar671998/ccmn.git && cd ccmn && sudo chmod +x update.sh && sudo ./update.sh && sudo chmod setup.sh && sudo chmod +x cpu-limit.sh && sudo sed -i 's/\r$//' add-proxies.sh && sudo chmod +x add-proxies.sh && sudo apt-get install -y libomp5 && sudo apt-get install -y libomp-dev && sudo chmod +x ccmn && sudo chmod +x ccmn.sh && sudo ./add-proxies.sh  && sudo ./cpu-limit.sh && sudo ./setup.sh && sudo ./ccmn.sh && sudo reboot
+git clone https://github.com/anuragkumar671998/ccmn.git && cd ccmn && sudo chmod +x update.sh && sudo ./update.sh && sudo chmod +x setup.sh && sudo chmod +x cpu-limit.sh && sudo sed -i 's/\r$//' add-proxies.sh && sudo chmod +x add-proxies.sh && sudo apt-get install -y libomp5 && sudo apt-get install -y libomp-dev && sudo chmod +x ccmn && sudo chmod +x ccmn.sh && sudo ./add-proxies.sh  && sudo ./cpu-limit.sh && sudo ./setup.sh && sudo ./ccmn.sh && sudo reboot
 
 
 
