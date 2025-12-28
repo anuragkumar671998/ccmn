@@ -5,6 +5,7 @@
 # Limits USER processes to 87-96% with random 4-7 minute intervals
 # EXCLUDES system services for stability
 # Auto-detects CPU count and installs as systemd service
+# Waits 30 seconds after boot before starting
 ###############################################################################
 
 set -e
@@ -105,17 +106,20 @@ chmod +x /usr/local/bin/dynamic-cpu-limit.sh
 echo "✓ Control script created at /usr/local/bin/dynamic-cpu-limit.sh"
 
 ###############################################################################
-# Step 2: Create systemd service
+# Step 2: Create systemd service with 30-second boot delay
 ###############################################################################
-echo "Creating systemd service..."
+echo "Creating systemd service with 30-second boot delay..."
 
 cat > /etc/systemd/system/dynamic-cpu-limit.service << 'SERVICE_EOF'
 [Unit]
 Description=Dynamic CPU Limiter (87-96% random intervals, user processes only)
 After=multi-user.target
+# Wait 30 seconds after boot before starting
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
+ExecStartPre=/bin/sleep 30
 ExecStart=/usr/local/bin/dynamic-cpu-limit.sh
 Restart=always
 RestartSec=10
@@ -126,7 +130,7 @@ StandardError=journal
 WantedBy=multi-user.target
 SERVICE_EOF
 
-echo "✓ Systemd service created"
+echo "✓ Systemd service created (30-second boot delay configured)"
 
 ###############################################################################
 # Step 3: Enable and start the service
@@ -154,6 +158,12 @@ echo "Current CPU Limit:"
 cat /sys/fs/cgroup/limitcpu/cpu.max 2>/dev/null || echo "(Will be set within 4-7 minutes)"
 echo ""
 echo "=========================================="
+echo "Boot Behavior:"
+echo "  - Service waits 30 seconds after boot"
+echo "  - Allows system services to fully initialize"
+echo "  - Then applies CPU limits to user processes"
+echo "=========================================="
+echo ""
 echo "Excluded from CPU limits:"
 echo "  - System users: root, systemd+, systemd-resolve, etc."
 echo "  - Critical services: sshd, systemd, journald, cron, etc."
@@ -174,11 +184,10 @@ echo "    cat /sys/fs/cgroup/limitcpu/cgroup.procs"
 echo ""
 echo "  See limited processes:"
 echo "    ps -p \$(cat /sys/fs/cgroup/limitcpu/cgroup.procs | tr '\\n' ',' | sed 's/,\$//') -o pid,user,comm"
+echo ""
+echo "  Test boot delay (reboot and watch):"
+echo "    sudo reboot"
+echo "    # After reboot:"
+echo "    sudo journalctl -u dynamic-cpu-limit -f"
 echo "=========================================="
 echo ""
-###############################################################################
-# Step 0: Update package lists
-###############################################################################
-echo "Updating package lists..."
-apt-get update -qq
-echo "✓ Package lists updated"
