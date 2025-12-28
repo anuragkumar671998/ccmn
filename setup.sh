@@ -1,446 +1,303 @@
 #!/bin/bash
-#
-# AWS Metadata Blocker with Automatic SSH Exception
-# Automatically detects and whitelists SSH connections
-# Fetches public IP and preserves SSH access after every reboot
-#
-# Usage: sudo ./block-metadata-ultimate.sh
-#
+# block-aws-metadata-secure-ssh-fix.sh - Robust script to block metadata, ensure SSH is allowed, and persist across reboots.
 
-set -e
+# --- Configuration ---
+METADATA_IP="169.254.169.254"
+METADATA_RANGE="169.254.0.0/16"
+SSH_PORT="22"
+METADATA_WRAPPER_DIR="/usr/local/bin"
+NFTABLES_CONF="/etc/nftables.conf"
+SYSCTL_CONF="/etc/sysctl.d/99-metadata-block.conf"
+ENV_VARS_FILE="/etc/environment"
+METADATA_PERSISTENCE_SERVICE="aws-metadata-ssh-protection.service"
+NFTABLES_SERVICE="nftables.service"
+# --- End Configuration ---
 
-# Colors
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m'
+# --- Helper Functions ---
+log_info() { echo "[INFO] $1"; }
+log_success() { echo "[SUCCESS] $1"; }
+log_warning() { echo "[WARNING] $1"; }
+log_error() { echo "[ERROR] $1"; }
+command_exists() { command -v "$1" &> /dev/null; }
 
-echo -e "${BLUE}================================${NC}"
-echo -e "${BLUE}🔒 METADATA BLOCKER + SSH KEEPER${NC}"
-echo -e "${BLUE}================================${NC}"
-echo ""
+# --- Pre-flight Checks ---
+if [[ $EUID -ne 0 ]]; then
+   log_error "This script must be run as root. Use sudo."
+   exit 1
+fi
 
-# Check root
-if [ "$EUID" -ne 0 ]; then 
-    echo -e "${RED}❌ Please run as root: sudo $0${NC}"
+log_info "Starting AWS Metadata & SSH Protection Script..."
+
+# --- CRITICAL: AWS Security Group Check Reminder ---
+log_warning "--------------------------------------------------------------------"
+log_warning "IMPORTANT: Ensure your AWS Security Group allows inbound SSH (TCP port ${SSH_PORT}) from your IP address."
+log_warning "This script cannot fix external network configurations."
+log_warning "--------------------------------------------------------------------"
+sleep 3 # Give user time to read
+
+# --- 1. Install Dependencies ---
+log_info "Ensuring necessary packages are installed (nftables, iproute2, curl, wget, netcat)..."
+apt-get update >/dev/null && apt-get install -y nftables iproute2 curl wget netcat >/dev/null
+if [ $? -ne 0 ]; then
+    log_error "Failed to install necessary packages. Please install them manually and re-run the script."
     exit 1
 fi
+log_success "Dependencies installed."
 
-#==============================================================================
-# DETECT SSH CONNECTION AND PUBLIC IP
-#==============================================================================
-echo -e "${GREEN}[1/8] Detecting SSH connection details...${NC}"
-
-# Get current SSH client IP if in SSH session
-SSH_CLIENT_IP=""
-if [ ! -z "$SSH_CLIENT" ]; then
-    SSH_CLIENT_IP=$(echo $SSH_CLIENT | awk '{print $1}')
-    echo -e "${YELLOW}   Detected SSH from: $SSH_CLIENT_IP${NC}"
+# --- 2. Backup Original Commands and Create Wrappers ---
+log_info "Backing up original curl and wget commands if they are not already backed up..."
+if command_exists curl && [ ! -f /usr/bin/curl.real ]; then
+    mv /usr/bin/curl /usr/bin/curl.real 2>/dev/null
+    log_info "Original curl moved to /usr/bin/curl.real"
 fi
-
-if [ ! -z "$SSH_CONNECTION" ]; then
-    SSH_SRC=$(echo $SSH_CONNECTION | awk '{print $1}')
-    if [ -z "$SSH_CLIENT_IP" ]; then
-        SSH_CLIENT_IP="$SSH_SRC"
-    fi
-    echo -e "${YELLOW}   SSH connection: $SSH_CONNECTION${NC}"
+if command_exists wget && [ ! -f /usr/bin/wget.real ]; then
+    mv /usr/bin/wget /usr/bin/wget.real 2>/dev/null
+    log_info "Original wget moved to /usr/bin/wget.real"
 fi
+log_success "Original commands backed up."
 
-# Get public IP from metadata (before blocking it!)
-echo -e "${YELLOW}   Fetching instance public IP...${NC}"
-PUBLIC_IP=$(timeout 3 curl -s http://169.254.169.254/latest/meta-data/public-ipv4 2>/dev/null || echo "")
-
-if [ -z "$PUBLIC_IP" ]; then
-    # Alternative method using external service
-    PUBLIC_IP=$(timeout 3 curl -s https://ifconfig.me 2>/dev/null || echo "unknown")
-fi
-
-# Get private IP
-IFACE=$(ip route | grep default | awk '{print $5}' | head -1)
-if [ -z "$IFACE" ]; then
-    IFACE="ens5"
-fi
-PRIVATE_IP=$(ip addr show $IFACE | grep "inet " | awk '{print $2}' | cut -d'/' -f1 | head -1)
-
-# Get all active SSH connections
-ACTIVE_SSH_IPS=$(ss -tn state established '( dport = :22 or sport = :22 )' | grep -v "127.0.0.1" | awk '{print $4, $5}' | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | sort -u || echo "")
-
-echo -e "${GREEN}   ✅ Network Information:${NC}"
-echo "      Interface: $IFACE"
-echo "      Private IP: $PRIVATE_IP"
-echo "      Public IP: $PUBLIC_IP"
-echo "      SSH Client: $SSH_CLIENT_IP"
-echo "      Active SSH IPs: $ACTIVE_SSH_IPS"
-echo ""
-
-#==============================================================================
-# STEP 2: APPLICATION WRAPPERS
-#==============================================================================
-echo -e "${GREEN}[2/8] Creating application wrappers...${NC}"
-
-tee /usr/local/bin/curl-wrapper > /dev/null << 'EOF'
+log_info "Creating application wrappers for curl and wget..."
+cat << EOF > "${METADATA_WRAPPER_DIR}/curl-wrapper"
 #!/bin/bash
-if echo "$@" | grep -qE "169\.254\.169\.254"; then
-    echo "ERROR: Access to AWS metadata service is blocked" >&2
-    exit 1
-fi
-exec /usr/bin/curl.real "$@"
-EOF
+# Wrapper to block AWS metadata access by checking arguments
+METADATA_IP="$METADATA_IP"
+METADATA_RANGE="$METADATA_RANGE"
 
-tee /usr/local/bin/wget-wrapper > /dev/null << 'EOF'
-#!/bin/bash
-if echo "$@" | grep -qE "169\.254\.169\.254"; then
-    echo "ERROR: Access to AWS metadata service is blocked" >&2
-    exit 1
-fi
-exec /usr/bin/wget.real "$@"
-EOF
-
-chmod +x /usr/local/bin/curl-wrapper
-chmod +x /usr/local/bin/wget-wrapper
-
-if [ -f /usr/bin/curl ] && [ ! -L /usr/bin/curl ]; then
-    cp /usr/bin/curl /usr/bin/curl.real
-fi
-ln -sf /usr/local/bin/curl-wrapper /usr/bin/curl
-
-if [ -f /usr/bin/wget ] && [ ! -L /usr/bin/wget ]; then
-    cp /usr/bin/wget /usr/bin/wget.real
-fi
-ln -sf /usr/local/bin/wget-wrapper /usr/bin/wget
-
-echo -e "${GREEN}   ✅ Wrappers installed${NC}"
-
-#==============================================================================
-# STEP 3: SAVE SSH EXCEPTION DATA
-#==============================================================================
-echo -e "${GREEN}[3/8] Saving SSH exception data...${NC}"
-
-mkdir -p /etc/metadata-block
-
-# Save IPs for persistence
-tee /etc/metadata-block/ssh-whitelist.conf > /dev/null << EOF
-# SSH Whitelist - Auto-generated
-PUBLIC_IP=$PUBLIC_IP
-PRIVATE_IP=$PRIVATE_IP
-SSH_CLIENT_IP=$SSH_CLIENT_IP
-IFACE=$IFACE
-ACTIVE_SSH_IPS="$ACTIVE_SSH_IPS"
-EOF
-
-echo -e "${GREEN}   ✅ Whitelist saved to /etc/metadata-block/ssh-whitelist.conf${NC}"
-
-#==============================================================================
-# STEP 4: IPTABLES WITH SSH EXCEPTIONS
-#==============================================================================
-echo -e "${GREEN}[4/8] Configuring iptables with SSH exceptions...${NC}"
-
-DEBIAN_FRONTEND=noninteractive apt-get install -y iptables-persistent > /dev/null 2>&1 || true
-
-# Flush existing metadata rules
-iptables -D OUTPUT -d 169.254.169.254 -j DROP 2>/dev/null || true
-iptables -D OUTPUT -d 169.254.169.254 -j REJECT 2>/dev/null || true
-iptables -D OUTPUT -d 169.254.0.0/16 -j DROP 2>/dev/null || true
-
-# Clear any existing metadata chain
-iptables -F metadata-block 2>/dev/null || true
-iptables -X metadata-block 2>/dev/null || true
-
-# Create new chain for metadata blocking
-iptables -N metadata-block 2>/dev/null || true
-
-# CRITICAL: Allow established SSH connections FIRST
-iptables -A metadata-block -m state --state ESTABLISHED,RELATED -j RETURN
-
-# Allow SSH port (22) - NEVER block this
-iptables -A metadata-block -p tcp --dport 22 -j RETURN
-iptables -A metadata-block -p tcp --sport 22 -j RETURN
-
-# Allow connections FROM known SSH clients
-if [ ! -z "$SSH_CLIENT_IP" ]; then
-    iptables -A metadata-block -s $SSH_CLIENT_IP -j RETURN
-fi
-
-# Allow all active SSH IPs
-for ip in $ACTIVE_SSH_IPS; do
-    if [ ! -z "$ip" ] && [ "$ip" != "127.0.0.1" ]; then
-        iptables -A metadata-block -s $ip -j RETURN 2>/dev/null || true
-        iptables -A metadata-block -d $ip -j RETURN 2>/dev/null || true
+# Check if any argument contains metadata IP or domain
+args=("$@")
+for arg in "\${args[@]}"; do
+    if [[ "\$arg" == *"\$METADATA_IP"* ]] || [[ "\$arg" == *"\$METADATA_RANGE"* ]]; then
+        echo "ERROR: Access to AWS metadata service is blocked"
+        exit 1
     fi
 done
+# Call the original command
+/usr/bin/curl.real "\$@"
+EOF
+chmod +x "${METADATA_WRAPPER_DIR}/curl-wrapper"
 
-# NOW block metadata
-iptables -A metadata-block -d 169.254.169.254 -p tcp --dport 80 -j REJECT --reject-with tcp-reset
-iptables -A metadata-block -d 169.254.169.254 -p tcp --dport 443 -j REJECT --reject-with tcp-reset
-iptables -A metadata-block -d 169.254.169.254 -j REJECT
+cat << EOF > "${METADATA_WRAPPER_DIR}/wget-wrapper"
+#!/bin/bash
+# Wrapper to block AWS metadata access by checking arguments
+METADATA_IP="$METADATA_IP"
+METADATA_RANGE="$METADATA_RANGE"
 
-# Apply chain to OUTPUT
-iptables -I OUTPUT -d 169.254.169.254 -j metadata-block
+# Check if any argument contains metadata IP or domain
+args=("$@")
+for arg in "\${args[@]}"; do
+    if [[ "\$arg" == *"\$METADATA_IP"* ]] || [[ "\$arg" == *"\$METADATA_RANGE"* ]]; then
+        echo "ERROR: Access to AWS metadata service is blocked"
+        exit 1
+    fi
+done
+# Call the original command
+/usr/bin/wget.real "\$@"
+EOF
+chmod +x "${METADATA_WRAPPER_DIR}/wget-wrapper"
+log_success "curl and wget wrappers installed."
 
-# Save rules
-mkdir -p /etc/iptables
-iptables-save > /etc/iptables/rules.v4
+# --- 3. Configure /etc/hosts ---
+log_info "Updating /etc/hosts to block metadata DNS resolution..."
+if ! grep -q "$METADATA_IP metadata.google.internal" /etc/hosts; then
+    echo "127.0.0.1 $METADATA_IP metadata.google.internal" >> /etc/hosts
+    log_success "/etc/hosts updated."
+else
+    log_warning "/etc/hosts already contains metadata blocking entry. Ensuring it's correct."
+    sed -i "s|^127.0.0.1.*metadata.google.internal|127.0.0.1 $METADATA_IP metadata.google.internal|" /etc/hosts
+fi
 
-echo -e "${GREEN}   ✅ iptables configured with SSH protection${NC}"
+# --- 4. Configure Kernel Parameters ---
+log_info "Configuring kernel parameters for route_localnet..."
+cat << EOF > "$SYSCTL_CONF"
+# Prevent routing to local meta-IPs
+net.ipv4.conf.all.route_localnet = 0
+net.ipv4.conf.default.route_localnet = 0
+EOF
+# Attempt to detect primary interface name, fallback to ens5
+DETECTED_IFACE=$(ip -o -4 route show to exact default | awk '{print $5}')
+if [ -z "$DETECTED_IFACE" ]; then
+    DETECTED_IFACE="ens5" # Fallback
+    log_warning "Could not auto-detect network interface, using fallback 'ens5'."
+fi
+echo "net.ipv4.conf.${DETECTED_IFACE}.route_localnet = 0" >> "$SYSCTL_CONF"
+echo "net.ipv4.ip_forward = 0" >> "$SYSCTL_CONF"
 
-#==============================================================================
-# STEP 5: NFTABLES (OPTIONAL - WITH SSH EXCEPTION)
-#==============================================================================
-echo -e "${GREEN}[5/8] Configuring nftables with SSH exception...${NC}"
+sysctl -p "$SYSCTL_CONF" > /dev/null
+log_success "Kernel parameters configured and applied."
 
-apt-get install -y nftables > /dev/null 2>&1 || true
+# --- 5. Configure Proxy Bypass Prevention ---
+log_info "Configuring proxy bypass prevention in ${ENV_VARS_FILE}..."
+TEMP_ENV_VARS=$(mktemp)
+cp "$ENV_VARS_FILE" "$TEMP_ENV_VARS"
 
-tee /etc/nftables.conf > /dev/null << EOF
+# Ensure no_proxy is set correctly, prepending if not present
+if grep -q "no_proxy=" "$TEMP_ENV_VARS"; then
+    if ! grep -q "$METADATA_IP" "$TEMP_ENV_VARS"; then
+        sed -i "s|^no_proxy=|no_proxy=localhost,127.0.0.1,$METADATA_IP,$METADATA_RANGE,|" "$TEMP_ENV_VARS"
+    fi
+else
+    echo "no_proxy=localhost,127.0.0.1,$METADATA_IP,$METADATA_RANGE" >> "$TEMP_ENV_VARS"
+fi
+
+# Ensure NO_PROXY is set correctly, prepending if not present
+if grep -q "NO_PROXY=" "$TEMP_ENV_VARS"; then
+    if ! grep -q "$METADATA_IP" "$TEMP_ENV_VARS"; then
+        sed -i "s|^NO_PROXY=|NO_PROXY=localhost,127.0.0.1,$METADATA_IP,$METADATA_RANGE,|" "$TEMP_ENV_VARS"
+    fi
+else
+    echo "NO_PROXY=localhost,127.0.0.1,$METADATA_IP,$METADATA_RANGE" >> "$TEMP_ENV_VARS"
+fi
+
+mv "$TEMP_ENV_VARS" "$ENV_VARS_FILE"
+log_success "Proxy bypass prevention configured in ${ENV_VARS_FILE}."
+export no_proxy="localhost,127.0.0.1,$METADATA_IP,$METADATA_RANGE"
+export NO_PROXY="localhost,127.0.0.1,$METADATA_IP,$METADATA_RANGE"
+
+# --- 6. Configure nftables Firewall (with SSH Allow) ---
+log_info "Configuring nftables firewall including SSH allow rule..."
+cat << EOF > "$NFTABLES_CONF"
 #!/usr/sbin/nft -f
 
 flush ruleset
 
-table inet metadata_block {
-    chain output {
-        type filter hook output priority 0; policy accept;
-        
-        # ALLOW SSH (critical!)
-        tcp sport 22 accept
-        tcp dport 22 accept
-        
-        # ALLOW established connections
+table inet filter {
+    chain input {
+        type filter hook input priority 0; policy accept; # Default to accept all incoming
+
+        # !!! IMPORTANT: Allow SSH inbound (TCP port ${SSH_PORT}) !!!
+        tcp dport ${SSH_PORT} accept
+
+        # Allow established/related connections
         ct state established,related accept
-        
-        # Block metadata service
-        ip daddr 169.254.169.254 tcp dport 80 counter drop comment "Block metadata HTTP"
-        ip daddr 169.254.169.254 tcp dport 443 counter drop comment "Block metadata HTTPS"
-        ip daddr 169.254.169.254 counter reject comment "Block metadata other"
+
+        # Drop/reject traffic to metadata IP and range
+        ip daddr ${METADATA_IP} reject with icmpx-admin-prohibited
+        ip daddr ${METADATA_RANGE} reject with icmpx-admin-prohibited
+    }
+
+    chain output {
+        type filter hook output priority 0; policy accept; # Default to accept all outgoing
+
+        # Drop traffic to metadata IP and range
+        ip daddr ${METADATA_IP} drop
+        ip daddr ${METADATA_RANGE} drop
     }
 }
 EOF
+log_success "nftables ruleset created at ${NFTABLES_CONF}."
 
-# Don't enable nftables if it conflicts with iptables
-# systemctl enable nftables > /dev/null 2>&1 || true
-# systemctl restart nftables > /dev/null 2>&1 || true
+# Ensure nftables service is enabled and running
+if ! systemctl is-enabled "${NFTABLES_SERVICE}"; then
+    systemctl enable "${NFTABLES_SERVICE}"
+    log_info "${NFTABLES_SERVICE} enabled."
+fi
+systemctl restart "${NFTABLES_SERVICE}" > /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    log_error "Failed to restart ${NFTABLES_SERVICE}. Please check ${NFTABLES_CONF} and nftables service status."
+    log_error "SSH may be inaccessible if nftables is broken. Manual intervention may be required."
+    exit 1
+fi
+log_success "${NFTABLES_SERVICE} configured and running."
 
-echo -e "${GREEN}   ✅ nftables configured (not activated to avoid conflicts)${NC}"
+# --- 7. Add Blackhole Routes ---
+log_info "Adding blackhole routes..."
+ip route add blackhole "${METADATA_IP}/32" > /dev/null 2>&1 || log_warning "Route for ${METADATA_IP} already exists or failed to add."
+ip route add blackhole "${METADATA_RANGE}" > /dev/null 2>&1 || log_warning "Route for ${METADATA_RANGE} already exists or failed to add."
+log_success "Blackhole routes added."
 
-#==============================================================================
-# STEP 6: /etc/hosts
-#==============================================================================
-echo -e "${GREEN}[6/8] Updating /etc/hosts...${NC}"
-
-sed -i '/169.254.169.254/d' /etc/hosts
-echo "127.0.0.1 169.254.169.254 metadata.google.internal" >> /etc/hosts
-
-echo -e "${GREEN}   ✅ /etc/hosts updated${NC}"
-
-#==============================================================================
-# STEP 7: KERNEL PARAMETERS
-#==============================================================================
-echo -e "${GREEN}[7/8] Configuring kernel parameters...${NC}"
-
-sed -i '/route_localnet/d' /etc/sysctl.conf
-sed -i '/# AWS Metadata/d' /etc/sysctl.conf
-
-tee -a /etc/sysctl.conf > /dev/null << EOF
-
-# AWS Metadata Blocking (SSH-safe)
-net.ipv4.conf.all.route_localnet=0
-net.ipv4.conf.default.route_localnet=0
-net.ipv4.conf.$IFACE.route_localnet=0
-EOF
-
-sysctl -p > /dev/null 2>&1
-
-echo -e "${GREEN}   ✅ Kernel parameters configured${NC}"
-
-#==============================================================================
-# STEP 8: SYSTEMD SERVICE (AUTO SSH DETECTION ON BOOT)
-#==============================================================================
-echo -e "${GREEN}[8/8] Creating smart systemd service...${NC}"
-
-tee /etc/systemd/system/metadata-block.service > /dev/null << 'EOF'
+# --- 8. Create Systemd Service for Persistence ---
+log_info "Creating systemd service for persistence of wrappers, routes, sysctl, and nftables..."
+cat << EOF > "/etc/systemd/system/${METADATA_PERSISTENCE_SERVICE}"
 [Unit]
-Description=AWS Metadata Blocker with SSH Keeper
-After=network-online.target sshd.service
-Wants=network-online.target
-Before=network.target
+Description=AWS Metadata Blocker & SSH Persistence
+Wants=${NFTABLES_SERVICE}
+After=network.target ${NFTABLES_SERVICE}
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
 
-# Wait for SSH to be ready
-ExecStartPre=/bin/sleep 3
+# Re-apply wrappers and ensure they are linked correctly
+ExecStart=/bin/bash -c '
+  # Ensure wrappers are executable and linked correctly
+  chmod +x ${METADATA_WRAPPER_DIR}/curl-wrapper ${METADATA_WRAPPER_DIR}/wget-wrapper 2>/dev/null || true
+  
+  # Link curl if not already linked or if original is missing/broken
+  if [ ! -L /usr/bin/curl ] || [ ! -x /usr/bin/curl ]; then
+    if [ -f /usr/bin/curl.real ]; then
+      ln -sf ${METADATA_WRAPPER_DIR}/curl-wrapper /usr/bin/curl
+    elif command -v curl > /dev/null && [ ! -f /usr/bin/curl.real ]; then # If original curl exists but not .real
+       mv /usr/bin/curl /usr/bin/curl.real 2>/dev/null
+       ln -sf ${METADATA_WRAPPER_DIR}/curl-wrapper /usr/bin/curl
+    fi
+  fi
 
-# Restore wrappers
-ExecStart=/bin/bash -c 'if [ -f /usr/bin/curl ] && [ ! -L /usr/bin/curl ]; then cp /usr/bin/curl /usr/bin/curl.real 2>/dev/null || true; fi; ln -sf /usr/local/bin/curl-wrapper /usr/bin/curl'
-ExecStart=/bin/bash -c 'if [ -f /usr/bin/wget ] && [ ! -L /usr/bin/wget ]; then cp /usr/bin/wget /usr/bin/wget.real 2>/dev/null || true; fi; ln -sf /usr/local/bin/wget-wrapper /usr/bin/wget'
+  # Link wget if not already linked or if original is missing/broken
+  if [ ! -L /usr/bin/wget ] || [ ! -x /usr/bin/wget ]; then
+    if [ -f /usr/bin/wget.real ]; then
+      ln -sf ${METADATA_WRAPPER_DIR}/wget-wrapper /usr/bin/wget
+    elif command -v wget > /dev/null && [ ! -f /usr/bin/wget.real ]; then # If original wget exists but not .real
+       mv /usr/bin/wget /usr/bin/wget.real 2>/dev/null
+       ln -sf ${METADATA_WRAPPER_DIR}/wget-wrapper /usr/bin/wget
+    fi
+  fi
+'
 
-# Run refresh script
-ExecStart=/usr/local/bin/refresh-ssh-whitelist.sh
+# Re-apply blackhole routes
+ExecStart=/sbin/ip route add blackhole ${METADATA_IP}/32 2>/dev/null || true
+ExecStart=/sbin/ip route add blackhole ${METADATA_RANGE} 2>/dev/null || true
 
-# Restore iptables
-ExecStart=/bin/bash -c 'if [ -f /etc/iptables/rules.v4 ]; then /sbin/iptables-restore < /etc/iptables/rules.v4; fi'
+# Re-apply sysctl settings
+ExecStart=/sbin/sysctl -p "${SYSCTL_CONF}" > /dev/null
 
-# Apply sysctl
-ExecStart=/sbin/sysctl -p
+# Ensure nftables service is active and rules are loaded (crucial for SSH allow rule)
+ExecStart=/bin/systemctl is-active --quiet ${NFTABLES_SERVICE} || /bin/systemctl start ${NFTABLES_SERVICE}
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-# Create refresh script that runs on every boot
-tee /usr/local/bin/refresh-ssh-whitelist.sh > /dev/null << 'EOF'
-#!/bin/bash
-# Refresh SSH whitelist on boot
-
-# Load saved config
-if [ -f /etc/metadata-block/ssh-whitelist.conf ]; then
-    source /etc/metadata-block/ssh-whitelist.conf
-fi
-
-# Get current active SSH connections
-CURRENT_SSH=$(ss -tn state established '( dport = :22 or sport = :22 )' | grep -v "127.0.0.1" | awk '{print $4, $5}' | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | sort -u)
-
-# Rebuild iptables chain with current SSH IPs
-iptables -F metadata-block 2>/dev/null || true
-iptables -X metadata-block 2>/dev/null || true
-iptables -N metadata-block 2>/dev/null || true
-
-# Allow established connections
-iptables -A metadata-block -m state --state ESTABLISHED,RELATED -j RETURN
-
-# Allow SSH port
-iptables -A metadata-block -p tcp --dport 22 -j RETURN
-iptables -A metadata-block -p tcp --sport 22 -j RETURN
-
-# Add current SSH IPs
-for ip in $CURRENT_SSH; do
-    if [ ! -z "$ip" ] && [ "$ip" != "127.0.0.1" ]; then
-        iptables -A metadata-block -s $ip -j RETURN 2>/dev/null || true
-        iptables -A metadata-block -d $ip -j RETURN 2>/dev/null || true
-    fi
-done
-
-# Block metadata
-iptables -A metadata-block -d 169.254.169.254 -p tcp --dport 80 -j REJECT --reject-with tcp-reset
-iptables -A metadata-block -d 169.254.169.254 -p tcp --dport 443 -j REJECT --reject-with tcp-reset
-iptables -A metadata-block -d 169.254.169.254 -j REJECT
-
-# Apply to OUTPUT
-iptables -D OUTPUT -d 169.254.169.254 -j metadata-block 2>/dev/null || true
-iptables -I OUTPUT -d 169.254.169.254 -j metadata-block
-
-# Save
-iptables-save > /etc/iptables/rules.v4
-
-echo "SSH whitelist refreshed with IPs: $CURRENT_SSH"
-EOF
-
-chmod +x /usr/local/bin/refresh-ssh-whitelist.sh
-
 systemctl daemon-reload
-systemctl enable metadata-block.service > /dev/null 2>&1
-systemctl start metadata-block.service > /dev/null 2>&1 || true
+systemctl enable "${METADATA_PERSISTENCE_SERVICE}" > /dev/null 2>&1 || log_warning "Failed to enable ${METADATA_PERSISTENCE_SERVICE}."
+systemctl restart "${METADATA_PERSISTENCE_SERVICE}" > /dev/null 2>&1 || log_warning "Failed to restart ${METADATA_PERSISTENCE_SERVICE}. Check its status."
+log_success "Persistence service (${METADATA_PERSISTENCE_SERVICE}) created and enabled."
 
-echo -e "${GREEN}   ✅ Smart service installed${NC}"
+# --- 9. Final Verification ---
+log_info "Running final verification tests..."
+echo ""
+echo "=== FINAL VERIFICATION TESTS ==="
 
-#==============================================================================
-# VERIFICATION
-#==============================================================================
-echo ""
-echo -e "${BLUE}================================${NC}"
-echo -e "${BLUE}🧪 VERIFICATION TESTS${NC}"
-echo -e "${BLUE}================================${NC}"
-echo ""
+echo -n "1. Curl to metadata: "
+curl -s -m 5 "http://${METADATA_IP}/latest/meta-data/" 2>&1 | head -3 | grep -q "ERROR:" && log_success "Blocked." || { log_warning "Not Blocked."; false; }
 
-# Test 1: SSH connection check
-echo -e "${YELLOW}Test 1: SSH Connection Status${NC}"
-if [ ! -z "$SSH_CONNECTION" ]; then
-    echo -e "${GREEN}   ✅ SSH session active: $SSH_CONNECTION${NC}"
-else
-    echo -e "${YELLOW}   ℹ️  Not in SSH session (console/local)${NC}"
-fi
+echo -n "2. Wget to metadata: "
+wget --timeout=2 -q -O - "http://${METADATA_IP}/latest/meta-data/" 2>&1 | head -3 | grep -q "ERROR:" && log_success "Blocked." || { log_warning "Not Blocked."; false; }
 
-# Test 2: SSH port listening
-echo ""
-echo -e "${YELLOW}Test 2: SSH Port Status${NC}"
-if ss -tuln | grep -q ":22 "; then
-    echo -e "${GREEN}   ✅ SSH listening on port 22${NC}"
-else
-    echo -e "${RED}   ❌ SSH NOT LISTENING - CHECK SSH SERVICE${NC}"
-fi
+echo -n "3. Netcat to metadata (should fail): "
+nc -z -w2 "${METADATA_IP}" 80 2>&1 | grep -q "failed:" && log_success "Connection failed as expected." || { log_warning "Connection succeeded!"; false; }
 
-# Test 3: Active SSH connections
-echo ""
-echo -e "${YELLOW}Test 3: Active SSH Connections${NC}"
-SSH_COUNT=$(ss -tn state established '( dport = :22 or sport = :22 )' | grep -c "ESTAB" || echo "0")
-if [ "$SSH_COUNT" -gt 0 ]; then
-    echo -e "${GREEN}   ✅ $SSH_COUNT active SSH connection(s)${NC}"
-    ss -tn state established '( dport = :22 or sport = :22 )' | grep "ESTAB" | head -5
-else
-    echo -e "${YELLOW}   ℹ️  No SSH connections detected${NC}"
-fi
+echo -n "4. Ping metadata (should fail): "
+ping -c 2 "${METADATA_IP}" > /dev/null 2>&1 && log_warning "Ping succeeded!" || log_success "Ping failed as expected."
 
-# Test 4: Metadata blocking
-echo ""
-echo -e "${YELLOW}Test 4: Metadata Access${NC}"
-METADATA_TEST=$(timeout 2 curl -s http://169.254.169.254/latest/meta-data/ 2>&1 || echo "BLOCKED")
-if echo "$METADATA_TEST" | grep -qi "blocked\|error\|refused"; then
-    echo -e "${GREEN}   ✅ Metadata BLOCKED${NC}"
-else
-    echo -e "${RED}   ⚠️  Metadata accessible: ${METADATA_TEST:0:50}${NC}"
-fi
+echo -n "5. Internet connectivity (proxy): "
+curl -s --connect-timeout 3 https://ifconfig.me | head -1 | grep -q "." && log_success "Works." || { log_warning "Failed."; false; }
 
-# Test 5: Internet
 echo ""
-echo -e "${YELLOW}Test 5: Internet Connectivity${NC}"
-INTERNET=$(timeout 3 /usr/bin/curl.real -s https://ifconfig.me 2>/dev/null || echo "FAILED")
-if [ "$INTERNET" != "FAILED" ]; then
-    echo -e "${GREEN}   ✅ Internet working (IP: $INTERNET)${NC}"
-else
-    echo -e "${YELLOW}   ⚠️  Internet check failed (may be normal)${NC}"
-fi
-
-#==============================================================================
-# SUMMARY
-#==============================================================================
+echo "--- CONFIGURATION SUMMARY ---"
+echo "✅ Application Wrappers: $([ -f "${METADATA_WRAPPER_DIR}/curl-wrapper" ] && echo 'Present' || echo 'MISSING')"
+echo "✅ nftables Configured: $([ -f "${NFTABLES_CONF}" ] && echo 'Present' || echo 'MISSING'). Service active: $(systemctl is-active ${NFTABLES_SERVICE})"
+echo "✅ nftables Rules for SSH: $(sudo nft list chain inet filter input | grep -c "tcp dport ${SSH_PORT} accept")"
+echo "✅ Blackhole Routes: $(ip route | grep -c blackhole)"
+echo "✅ /etc/hosts entry: $(grep -c "${METADATA_IP}" /etc/hosts)"
+echo "✅ Kernel Parameters Applied: $(sysctl net.ipv4.conf.all.route_localnet | grep '= 0' && sysctl net.ipv4.ip_forward | grep '= 0' && echo 'Applied' || echo 'Not Applied')"
+echo "✅ Proxy Bypass Config: $(grep -c "no_proxy=" "$ENV_VARS_FILE" || grep -c "NO_PROXY=" "$ENV_VARS_FILE")"
+echo "✅ Persistence Service (${METADATA_PERSISTENCE_SERVICE}): $(systemctl is-active ${METADATA_PERSISTENCE_SERVICE} && echo 'Active' || echo 'INACTIVE')"
 echo ""
-echo -e "${BLUE}================================${NC}"
-echo -e "${BLUE}📋 INSTALLATION SUMMARY${NC}"
-echo -e "${BLUE}================================${NC}"
-echo ""
-
-echo -e "${GREEN}🔒 Security Status:${NC}"
-echo "   ✓ Metadata service: BLOCKED"
-echo "   ✓ SSH connections: PROTECTED"
-echo "   ✓ Internet access: WORKING"
-echo ""
-
-echo -e "${GREEN}📡 Network Details:${NC}"
-echo "   • Public IP: $PUBLIC_IP"
-echo "   • Private IP: $PRIVATE_IP"
-echo "   • Interface: $IFACE"
-echo "   • SSH Client: ${SSH_CLIENT_IP:-none}"
-echo ""
-
-echo -e "${GREEN}🛡️ Active Protections:${NC}"
-echo "   • Application wrappers: $([ -L /usr/bin/curl ] && echo '✅' || echo '❌')"
-echo "   • iptables rules: $(iptables -L OUTPUT -n 2>/dev/null | grep -c 169.254.169.254)"
-echo "   • SSH whitelist entries: $(iptables -L metadata-block -n 2>/dev/null | grep -c RETURN || echo '0')"
-echo "   • Service enabled: $(systemctl is-enabled metadata-block.service 2>/dev/null || echo 'no')"
-echo ""
-
-echo -e "${YELLOW}📌 SSH Connection Info:${NC}"
-echo "   To reconnect: ssh $USER@$PUBLIC_IP"
-echo "   Whitelisted IPs saved in: /etc/metadata-block/ssh-whitelist.conf"
-echo ""
-
-echo -e "${YELLOW}🔄 After Reboot:${NC}"
-echo "   • SSH whitelist auto-refreshes"
-echo "   • Metadata stays blocked"
-echo "   • Your SSH session preserved"
-echo ""
-
-echo -e "${GREEN}✅ Installation complete - SSH is SAFE!${NC}"
-echo ""
+log_info "Installation complete."
+log_info "--------------------------------------------------------------------"
+log_warning "FINAL CHECK: REBOOT AND TEST SSH ACCESS IMMEDIATELY."
+log_warning "If SSH fails, the issue is MOST LIKELY in your AWS Security Group or Network ACLs."
+log_warning "Ensure inbound TCP port ${SSH_PORT} is allowed from your IP."
+log_warning "--------------------------------------------------------------------"
 
 exit 0
