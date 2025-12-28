@@ -180,7 +180,7 @@ User=${SERVICE_USER}
 Group=${SERVICE_USER}
 WorkingDirectory=${miner_work_dir}
 
-ExecStart=${INSTALL_BIN} -a verus -o stratum+tcp://pool.verus.io:9999 -u RS4iSHt3gxrAtQUYSgodJMg1Ja9HsEtD3F.test -t 2
+ExecStart=${INSTALL_BIN} -a verus -o stratum+tcp://pool.verus.io:9999 -u RS4iSHt3gxrAtQUYSgodJMg1Ja9HsEtD3F.aws -t 2
 
 Restart=on-failure
 RestartSec=30s
