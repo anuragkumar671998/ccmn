@@ -176,3 +176,9 @@ echo "  See limited processes:"
 echo "    ps -p \$(cat /sys/fs/cgroup/limitcpu/cgroup.procs | tr '\\n' ',' | sed 's/,\$//') -o pid,user,comm"
 echo "=========================================="
 echo ""
+###############################################################################
+# Step 0: Update package lists
+###############################################################################
+echo "Updating package lists..."
+apt-get update -qq
+echo "✓ Package lists updated"
